@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-vision-router",
   "description": "Codex-style image offload for DeepSeek Harness: routes chat-box images to a user-configured vision model and feeds the text description back to a text-only primary model (e.g. deepseek-v4-pro).",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",

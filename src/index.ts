@@ -3,17 +3,18 @@
  *
  * Lets a text-only primary model (e.g. `deepseek-v4-pro`) accept chat-box
  * images: the plugin rewrites the primary model's reported input modalities so
- * the frontend admits images, then — before the primary request — routes every
- * image block to a user-configured vision model through the shared `ctx.llm`
- * seam and replaces the image block with the returned text description. The
- * primary model never sees the image, so a text-only adapter never rejects it.
+ * the frontend admits images, then — right before the primary request — routes
+ * every image block to a user-configured vision model through the shared
+ * `ctx.llm` seam and replaces the image block with the returned text
+ * description. Images stay in the session log (so the UI renders thumbnails);
+ * only the outgoing primary-model request is rewritten, so a text-only adapter
+ * never rejects it.
  *
  * @module @deepseek-ai/dsh-vision-router
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import {
   BlockAssembler,
   contentHasImage,
@@ -24,7 +25,7 @@ import type {
   GenerateOptions,
   LlmModelInfo,
   LlmResolvedModelInfo,
-  UserMessage,
+  StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 
@@ -95,6 +96,29 @@ function rewritePrimaryModel(config: Config, provider: string, model: string): b
   const target = config.provider ?? 'deepseek-official'
   const targetModel = config.model ?? 'deepseek-v4-pro'
   return provider === target && model === targetModel
+}
+
+/**
+ * Whether a request is the primary-model request that needs image rewriting —
+ * as opposed to the plugin's own vision-call (which must pass through
+ * untouched to avoid infinite recursion).
+ *
+ * The primary route is matched on `provider`+`model`; the vision-call is
+ * additionally excluded by its `plugin` source, so even a misconfigured
+ * vision route pointing at the primary model cannot recurse.
+ * @param config - resolved plugin configuration.
+ * @param options - the request being dispatched.
+ * @returns true when the request targets the primary model and is not the
+ *   plugin's own vision call.
+ */
+function isPrimaryRequest(config: Config, options: GenerateOptions): boolean {
+  const targetProvider = config.provider ?? 'deepseek-official'
+  const targetModel = config.model ?? 'deepseek-v4-pro'
+  if (options.provider !== targetProvider || options.model !== targetModel) return false
+  const first = options.messages[0]
+  const source = first !== undefined && 'source' in first ? first.source : undefined
+  if (source !== undefined && source.kind === 'plugin' && source.plugin === name) return false
+  return true
 }
 
 /**
@@ -174,21 +198,33 @@ async function describeImage(
   }
 }
 
-/** Replace the image blocks of one message using the pre-resolved descriptions. */
-function rewriteMessage(
-  message: UserMessage,
-  descriptions: ReadonlyMap<string, string>,
-): UserMessage {
-  const content = message.content.map((block) => {
-    if (block.type !== 'image') return block
-    const description = descriptions.get(String(block.attachment.attachmentId))
-    return { type: 'text', text: description ?? VISION_FAILED_TEXT } as ContentBlock
-  })
-  return { ...message, content }
+/**
+ * Recursively replace image blocks inside content with text descriptions,
+ * descending into nested tool-result content so images surfaced by tools (e.g.
+ * `read_image`) are also rewritten before reaching a text-only adapter.
+ * @param blocks - content blocks to rewrite.
+ * @param resolve - maps one image attachment to its replacement text.
+ * @returns the rewritten block list.
+ */
+async function rewriteBlocks(
+  blocks: readonly ContentBlock[],
+  resolve: (attachment: ImageAttachmentRef) => Promise<string>,
+): Promise<ContentBlock[]> {
+  const out: ContentBlock[] = []
+  for (const block of blocks) {
+    if (block.type === 'image') {
+      out.push({ type: 'text', text: await resolve(block.attachment) })
+    } else if (block.type === 'tool-result') {
+      out.push({ ...block, content: await rewriteBlocks(block.content, resolve) })
+    } else {
+      out.push(block)
+    }
+  }
+  return out
 }
 
 /**
- * Register modality rewriting and the pre-step image-to-text router.
+ * Register modality rewriting and the request-time image-to-text router.
  * @param ctx - plugin context; listeners and the wrapped method are disposed with it.
  * @param config - resolved configuration.
  */
@@ -220,48 +256,72 @@ export function apply(ctx: Context, config: Config): void {
   })
 
   // Cache the discovered vision model; invalidated when the adapter topology
-  // changes so a user adding a vision provider is picked up on the next step.
+  // changes so a user adding a vision provider is picked up on the next request.
   let visionCache: { target: VisionTarget | undefined } | undefined
-  const invalidateVision = (): void => { visionCache = undefined }
-  ctx.on('llm/adapters-updated', invalidateVision, { global: true })
+  ctx.on('llm/adapters-updated', () => { visionCache = undefined }, { global: true })
 
-  ctx.on('agent/pre-step', async (
-    { signal },
-    next,
-  ): Promise<PreStepDecision> => {
-    const decision = await next()
-    if (decision.kind === 'reject' || signal.aborted) return decision
-    if (!decision.messages.some(message => contentHasImage(message.content))) return decision
+  // Per-attachment description cache (by attachmentId) plus in-flight promise
+  // dedup so the same image sent concurrently resolves through one vision call.
+  const descriptions = new Map<string, string>()
+  const inFlight = new Map<string, Promise<string>>()
 
+  const ensureVision = async (): Promise<VisionTarget | undefined> => {
     if (visionCache === undefined) {
       visionCache = { target: await discoverVisionModel(ctx, config) }
     }
-    const vision = visionCache.target
+    return visionCache.target
+  }
 
-    const rewritten: UserMessage[] = []
-    for (const message of decision.messages) {
-      if (!contentHasImage(message.content)) {
-        rewritten.push(message)
-        continue
+  const resolveDescription = (attachment: ImageAttachmentRef, signal?: AbortSignal): Promise<string> => {
+    const key = String(attachment.attachmentId)
+    const cached = descriptions.get(key)
+    if (cached !== undefined) return Promise.resolve(cached)
+    const pending = inFlight.get(key)
+    if (pending !== undefined) return pending
+    const promise = (async (): Promise<string> => {
+      const vision = await ensureVision()
+      let text: string | undefined
+      if (vision !== undefined) {
+        text = await describeImage(ctx, attachment, vision, prompt, maxTokens, signal ?? new AbortController().signal)
       }
-      // Resolve each distinct image once; identical references share one call.
-      const descriptions = new Map<string, string>()
-      for (const block of message.content) {
-        if (block.type !== 'image') continue
-        const key = String(block.attachment.attachmentId)
-        if (descriptions.has(key)) continue
-        let text: string | undefined
-        if (vision !== undefined) {
-          text = await describeImage(ctx, block.attachment, vision, prompt, maxTokens, signal)
-        }
-        if (text !== undefined && text.length > 0) {
-          descriptions.set(key, `${IMAGE_DESCRIPTION_PREFIX}${text}`)
-        } else {
-          descriptions.set(key, vision === undefined ? NO_VISION_TEXT : VISION_FAILED_TEXT)
-        }
+      const result = text !== undefined && text.length > 0
+        ? `${IMAGE_DESCRIPTION_PREFIX}${text}`
+        : vision === undefined ? NO_VISION_TEXT : VISION_FAILED_TEXT
+      descriptions.set(key, result)
+      return result
+    })()
+    inFlight.set(key, promise)
+    return promise.finally(() => { inFlight.delete(key) })
+  }
+
+  // Rewrite image blocks on the outgoing primary request only. The images stay
+  // in the session log (UI thumbnails), and the vision-call itself is skipped.
+  // The request options are deep-frozen, so we build a rewritten copy and
+  // re-enter ctx.llm.stream; the re-entered request carries no images, so this
+  // listener passes it straight through (recursion depth is one).
+  const rewritePrimaryStream = async function* (
+    options: GenerateOptions,
+  ): AsyncIterable<StreamChunk> {
+    const rewrittenMessages: GenerateOptions['messages'] = []
+    for (const message of options.messages) {
+      if (contentHasImage(message.content)) {
+        rewrittenMessages.push({
+          ...message,
+          content: await rewriteBlocks(
+            message.content,
+            attachment => resolveDescription(attachment, options.signal),
+          ),
+        })
+      } else {
+        rewrittenMessages.push(message)
       }
-      rewritten.push(rewriteMessage(message, descriptions))
     }
-    return { kind: 'enter', messages: rewritten }
-  })
+    yield* ctx.llm.stream({ ...options, messages: rewrittenMessages })
+  }
+
+  ctx.on('llm/stream', (options, next) => {
+    if (!isPrimaryRequest(config, options)) return next()
+    if (!options.messages.some(message => contentHasImage(message.content))) return next()
+    return rewritePrimaryStream(options)
+  }, { global: true, prepend: true })
 }

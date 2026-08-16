@@ -3,10 +3,12 @@
  *
  * Lets a text-only primary model (e.g. `deepseek-v4-pro`) accept chat-box
  * images: the plugin rewrites the primary model's reported input modalities so
- * the frontend admits images, then — before the primary request — routes every
- * image block to a user-configured vision model through the shared `ctx.llm`
- * seam and replaces the image block with the returned text description. The
- * primary model never sees the image, so a text-only adapter never rejects it.
+ * the frontend admits images, then — right before the primary request — routes
+ * every image block to a user-configured vision model through the shared
+ * `ctx.llm` seam and replaces the image block with the returned text
+ * description. Images stay in the session log (so the UI renders thumbnails);
+ * only the outgoing primary-model request is rewritten, so a text-only adapter
+ * never rejects it.
  *
  * @module @deepseek-ai/dsh-vision-router
  */
@@ -42,7 +44,7 @@ export interface Config {
 /** Schemastery validation for {@link Config}. */
 export declare const Config: z<Config>;
 /**
- * Register modality rewriting and the pre-step image-to-text router.
+ * Register modality rewriting and the request-time image-to-text router.
  * @param ctx - plugin context; listeners and the wrapped method are disposed with it.
  * @param config - resolved configuration.
  */

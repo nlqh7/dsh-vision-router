@@ -100,6 +100,26 @@ function messageHasImage(message: { content: readonly { type: string }[] }): boo
   return message.content.some(block => block.type === 'image')
 }
 
+/** Boot the full agent-loop harness with one or two adapters and the router plugin. */
+async function bootHarness(
+  main: TextOnlyAdapter,
+  vision: VisionAdapter | undefined,
+  config: visionRouter.Config,
+): Promise<Context> {
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(AgentRegistry)
+  await ctx.plugin(LocalAttachmentStore, { dshHome: undefined })
+  ctx.llm.registerAdapter(['main'], main)
+  if (vision !== undefined) ctx.llm.registerAdapter(['vision'], vision)
+  await ctx.plugin(visionRouter, config)
+  await ctx.plugin(AgentLoop, { agents: [] })
+  return ctx
+}
+
 describe('vision-router', () => {
   it('rewrites the primary model inputModalities so the frontend admits images', async () => {
     const ctx = new Context()
@@ -116,27 +136,15 @@ describe('vision-router', () => {
     expect(untouched.inputModalities).toEqual(['text'])
   })
 
-  it('replaces image blocks with the vision model description before the primary request', async () => {
-    const ctx = new Context()
-    await ctx.plugin(LlmRuntime)
-    await ctx.plugin(SessionStore)
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRuntime)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(LocalAttachmentStore, { dshHome: undefined })
-
+  it('keeps the image in the log and rewrites only the primary request', async () => {
     const main = new TextOnlyAdapter()
     const vision = new VisionAdapter('图中是一只猫。')
-    ctx.llm.registerAdapter(['main'], main)
-    ctx.llm.registerAdapter(['vision'], vision)
-
-    await ctx.plugin(visionRouter, {
+    const ctx = await bootHarness(main, vision, {
       provider: 'main',
       model: 'main-model',
       visionProvider: 'vision',
       visionModel: 'vision-model',
     })
-    await ctx.plugin(AgentLoop, { agents: [] })
 
     const ref = await ctx.attachments.saveImage({ data: ONE_PX_PNG, mediaType: 'image/png' })
     const agent = ctx.agentLoop.create(SessionId('img-1'), { provider: 'main', model: 'main-model' })
@@ -161,27 +169,15 @@ describe('vision-router', () => {
     expect(flattened).toContain('【图片内容】图中是一只猫。')
     expect(flattened).not.toContain('"image"')
 
-    // The durable surface records the rewritten text (the image block never enters the log).
+    // The image block STAYS in the durable log (UI renders a thumbnail).
     const userMessage = events(agent).find(e => e.type === 'user/message' && e.data.source.kind === 'user')
     expect(userMessage?.type === 'user/message'
-      && userMessage.data.content.some(block => block.type === 'text' && block.text.includes('【图片内容】'))).toBe(true)
+      && userMessage.data.content.some(block => block.type === 'image')).toBe(true)
   })
 
   it('degrades to a placeholder when no vision model is discoverable', async () => {
-    const ctx = new Context()
-    await ctx.plugin(LlmRuntime)
-    await ctx.plugin(SessionStore)
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRuntime)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(LocalAttachmentStore, { dshHome: undefined })
-
     const main = new TextOnlyAdapter()
-    ctx.llm.registerAdapter(['main'], main)
-
-    // No vision provider configured and none advertised -> discovery fails.
-    await ctx.plugin(visionRouter, { provider: 'main', model: 'main-model' })
-    await ctx.plugin(AgentLoop, { agents: [] })
+    const ctx = await bootHarness(main, undefined, { provider: 'main', model: 'main-model' })
 
     const ref = await ctx.attachments.saveImage({ data: ONE_PX_PNG, mediaType: 'image/png' })
     const agent = ctx.agentLoop.create(SessionId('img-2'), { provider: 'main', model: 'main-model' })
@@ -196,5 +192,54 @@ describe('vision-router', () => {
     expect(primaryRequest).toBeDefined()
     expect(primaryRequest!.messages.some(messageHasImage)).toBe(false)
     expect(JSON.stringify(primaryRequest!.messages)).toContain('未配置视觉模型')
+  })
+
+  it('describes the same image once across turns (description cache)', async () => {
+    const main = new TextOnlyAdapter()
+    const vision = new VisionAdapter('图中是一只猫。')
+    const ctx = await bootHarness(main, vision, {
+      provider: 'main',
+      model: 'main-model',
+      visionProvider: 'vision',
+      visionModel: 'vision-model',
+    })
+
+    const ref = await ctx.attachments.saveImage({ data: ONE_PX_PNG, mediaType: 'image/png' })
+    const agent = ctx.agentLoop.create(SessionId('img-cache'), { provider: 'main', model: 'main-model' })
+
+    agent.followup(createUserMessage({ content: [{ type: 'image', attachment: ref }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'image', attachment: ref }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+
+    // The same attachment is described once; both primary requests are text-only.
+    expect(vision.requests.length).toBe(1)
+    expect(main.requests.length).toBe(2)
+    expect(main.requests.every(r => !r.messages.some(messageHasImage))).toBe(true)
+  })
+
+  it('does not recurse into the plugin\'s own vision call', async () => {
+    const main = new TextOnlyAdapter()
+    const vision = new VisionAdapter('图中是一只猫。')
+    const ctx = await bootHarness(main, vision, {
+      provider: 'main',
+      model: 'main-model',
+      visionProvider: 'vision',
+      visionModel: 'vision-model',
+    })
+
+    const ref = await ctx.attachments.saveImage({ data: ONE_PX_PNG, mediaType: 'image/png' })
+    const agent = ctx.agentLoop.create(SessionId('img-norecurse'), { provider: 'main', model: 'main-model' })
+
+    agent.followup(createUserMessage({ content: [{ type: 'image', attachment: ref }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+
+    // The vision call went out with its image untouched (no nested description),
+    // proving the llm/stream listener skipped the plugin's own request.
+    const visionRequest = vision.requests[0]!
+    expect(visionRequest.provider).toBe('vision')
+    expect(visionRequest.model).toBe('vision-model')
+    expect(visionRequest.messages[0]!.content.some(block => block.type === 'image')).toBe(true)
+    expect(JSON.stringify(visionRequest.messages)).not.toContain('【图片内容】')
   })
 })
