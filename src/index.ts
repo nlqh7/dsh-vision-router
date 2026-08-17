@@ -91,11 +91,10 @@ interface VisionTarget {
   model: string
 }
 
-/** Report the primary model as image-capable so the frontend admits images. */
-function rewritePrimaryModel(config: Config, provider: string, model: string): boolean {
+/** Report every text-only model under the primary provider as image-capable. */
+function rewritePrimaryModel(config: Config, provider: string): boolean {
   const target = config.provider ?? 'deepseek-official'
-  const targetModel = config.model ?? 'deepseek-v4-pro'
-  return provider === target && model === targetModel
+  return provider === target
 }
 
 /**
@@ -113,8 +112,7 @@ function rewritePrimaryModel(config: Config, provider: string, model: string): b
  */
 function isPrimaryRequest(config: Config, options: GenerateOptions): boolean {
   const targetProvider = config.provider ?? 'deepseek-official'
-  const targetModel = config.model ?? 'deepseek-v4-pro'
-  if (options.provider !== targetProvider || options.model !== targetModel) return false
+  if (options.provider !== targetProvider) return false
   const first = options.messages[0]
   const source = first !== undefined && 'source' in first ? first.source : undefined
   if (source !== undefined && source.kind === 'plugin' && source.plugin === name) return false
@@ -244,7 +242,7 @@ export function apply(ctx: Context, config: Config): void {
       signal?: AbortSignal,
     ): Promise<LlmResolvedModelInfo> => {
       const info = await original(provider, model, signal)
-      if (rewritePrimaryModel(config, provider, model)) {
+      if (rewritePrimaryModel(config, provider) && !info.inputModalities?.includes('image')) {
         return { ...info, inputModalities: ['text', 'image'] }
       }
       return info
